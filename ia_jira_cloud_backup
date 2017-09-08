@@ -1,0 +1,131 @@
+#!/usr/bin/env python3
+#
+# This is a new script based on the workaround described in Atlassian JIRA
+# https://jira.atlassian.com/browse/JRACLOUD-67169?src=confmacro
+
+import os
+import sys
+import pprint
+import socket
+import time
+import json
+import requests
+
+# Feel free to move the destination of the download somewhere else
+location = '/var/tmp'
+curr_date = time.strftime("%Y%m%d")
+jira_bkp_file = '%s/JIRA-Cloud-BackUp-%s.zip' % (location, curr_date)
+
+#TODO: Please enter your credentials below!
+username = ''
+password = ''
+
+# Function to log output to STDOUT
+# Will output like so:
+# [PID] YYYY-MM-DD hh:mm:ss - MSG
+def logger(msg):
+	curr_pid = os.getpid()
+	syslog_date = time.strftime("%Y-%m-%d %H:%M:%S")
+	print ("[%s] %s - %s" % (curr_pid, syslog_date, msg))
+
+# Function to check if response code is 200
+# Takes in three arguments: URL, response code, and response message
+def resp_code_check(response_url, code, response_msg):
+	if code != 200:
+		msg = "## ERROR: '%s' returned code %s and msg -- '%s'" % (response_url, code, response_msg)
+		logger (msg)
+		sys.exit(NAGIOS_CRIT)
+
+#TODO: Please enter your site here!
+instance = ''
+headers = {
+	'accept': "application/json",
+	'content-type': 'application/json'
+}
+
+url = "%s/rest/auth/1/session" % instance
+payload = "{\"username\": \"%s\", \"password\": \"%s\"}" % (username, password)
+response = requests.request("POST", url, data=payload, headers=headers)
+# Check to make sure response is 200 OK
+resp_code_check(url, response.status_code, response.text)
+
+# Use these two cookies to authenticate all subsequent REST calls
+cookie_jar = response.cookies.get_dict()
+
+url = "%s/rest/backup/1/export/runbackup" % instance
+payload = "{\"cbAttachments\":\"true\", \"exportToCloud\":\"true\"}"
+response = requests.request("POST", url, data=payload, headers=headers, cookies=cookie_jar)
+# We check the response status a couple of lines below
+
+json_data = json.loads(response.text)
+
+try:
+	taskId = json_data['taskId']
+	# DEBUG
+	#print (taskId)
+except:
+	bkp_err = json_data['error']
+	msg = "## ERROR: Initializing backup job failed. Err msg -- %s" % bkp_err
+	logger (msg)
+	sys.exit(NAGIOS_WARN)
+
+# Double check that the response code is 200 OK
+# This would be very unusual to end here since it should not return the right
+# variables above if the REST call did not complete successfully.
+resp_code_check(url, response.status_code, response.text)
+
+# DEBUG
+#taskId = 21111 
+
+url = "%s/rest/internal/2/task/progress/%s" % (instance, taskId)
+response = requests.request("GET", url, headers=headers, cookies=cookie_jar)
+resp_code_check(url, response.status_code, response.text)
+
+json_data = json.loads(response.text)
+
+iter_counter = 0
+bkp_flag = None
+while bkp_flag == None:
+	time.sleep(10)
+	try:
+		bkp_status = json_data['status']
+		bkp_progress = json_data['progress']
+	except:
+		msg = "## ERROR: Getting backup job status failed."
+		logger (msg)
+		sys.exit(NAGIOS_UNK)
+
+	if bkp_status == 'Success' and bkp_progress == 100:
+		bkp_flag = True
+	else:
+		response = requests.request("GET", url, headers=headers, cookies=cookie_jar)
+		resp_code_check(url, response.status_code, response.text)
+		json_data = json.loads(response.text)
+		iter_counter = iter_counter + 10
+
+	# Exit script if it takes too long to download
+	if iter_counter == 300:
+		msg = "## ERROR: Backup job did not finish in 5 minutes."
+		logger (msg)
+		sys.exit(NAGIOS_CRIT)
+
+# Now obtain the location of the backup zip file and use it to construct a URL
+# endpoint below
+nested_json_data = json.loads(json_data['result'])
+media_file_id = nested_json_data['mediaFileId']
+file_name = nested_json_data['fileName']
+
+# Now download the file from Atlassian and rename it
+url = "%s/plugins/servlet/export/download/%s/%s" % (instance, media_file_id, file_name)
+response = requests.request("GET", url, headers=headers, cookies=cookie_jar, stream=True)
+
+with os.fdopen(os.open(jira_bkp_file, os.O_WRONLY | os.O_CREAT, 0o644), 'wb') as fh:
+	# Since the file is quite large and we are not too concerned about memory
+	# usage, go ahead and spcify a chunk size of 1MB
+	for chunk in response.iter_content(chunk_size=1048576):
+		if chunk: # filter out keep-alive new chunks
+			fh.write(chunk)
+
+msg = "## INFO: JIRA Backup completed successfully."
+logger (msg)
+sys.exit(NAGIOS_OK)
